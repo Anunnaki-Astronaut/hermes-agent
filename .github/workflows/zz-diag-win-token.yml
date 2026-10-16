@@ -1,0 +1,50 @@
+name: zz-diag-win-token
+on:
+  push:
+    branches: ['diag/e2e-win-token']
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [blacksmith-32vcpu-windows-2025, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: identity and UAC
+        shell: pwsh
+        run: |
+          whoami; whoami /groups /fo list | Select-String -Pattern "Group Name|Attributes" | Select-Object -First 40
+          Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System | Select-Object EnableLUA,ConsentPromptBehaviorAdmin,FilterAdministratorToken,LocalAccountTokenFilterPolicy | Format-List
+          whoami /priv | Select-String -Pattern "SeBackup|SeRestore|SeTakeOwnership|SeSecurity|SeTcb|SeDebug"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: SAFER normal-user token vs an Administrators-only file
+        shell: pwsh
+        run: |
+          $f = Join-Path $env:RUNNER_TEMP 'admin-only.txt'; 'x' | Set-Content $f
+          icacls $f /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F"
+          icacls $f
+          @'
+          import ctypes, sys
+          from ctypes import wintypes
+          a = ctypes.WinDLL("advapi32", use_last_error=True)
+          H = wintypes.HANDLE
+          lvl, prim = H(), H()
+          print("create", a.SaferCreateLevel(2, 0x20000, 1, ctypes.byref(lvl), None))
+          print("compute", a.SaferComputeTokenFromLevel(lvl, None, ctypes.byref(prim), 0, None), ctypes.get_last_error())
+          # group list of the computed token
+          n = wintypes.DWORD()
+          a.GetTokenInformation(prim, 2, None, 0, ctypes.byref(n))
+          buf = ctypes.create_string_buffer(n.value)
+          a.GetTokenInformation(prim, 2, buf, n, ctypes.byref(n))
+          cnt = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0]
+          class SA(ctypes.Structure): _fields_=[("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+          arr = ctypes.cast(ctypes.addressof(buf)+ctypes.sizeof(ctypes.c_void_p), ctypes.POINTER(SA*cnt))[0]
+          for g in arr:
+              s = ctypes.c_wchar_p(); a.ConvertSidToStringSidW(ctypes.c_void_p(g.Sid), ctypes.byref(s))
+              print("group", s.value, hex(g.Attributes))
+          '@ | Set-Content probe.py
+          python probe.py
